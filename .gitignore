@@ -1,0 +1,11 @@
+# Raw photos and the files generated from them
+*.CR3
+*.cr3
+*.xmp
+*.xmp.bak
+output/
+
+# Python
+.venv/
+__pycache__/
+*.pyc
