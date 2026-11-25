@@ -234,7 +234,8 @@ def identify(client, crop_b64: str, frame_b64: str, model: str, context: str = "
 
 # ---------------------------------------------------------------- main
 
-def process(path: Path, out_dir: Path, args, client) -> None:
+def process(path: Path, out_dir: Path, args, client) -> dict:
+    """Crop, identify and (unless --dry-run) write the sidecar. Returns what was found."""
     print(f"\n== {path.name}")
     data = cr3.read_cr3(path)
     img = Image.open(io.BytesIO(data.jpeg))
@@ -248,6 +249,8 @@ def process(path: Path, out_dir: Path, args, client) -> None:
     else:
         print("   AF: no in-focus point recorded; cropping the centre")
     rect = crop_rect(box, img.width, img.height, args.crop_scale)
+    found = {"focus_source": "af-point" if box else "centre", "location": args.location,
+             "date_taken": data.date_taken, "result": None, "model": None, "tagged_at": None}
 
     crop = orient(img.crop(rect), data.orientation)
     crop_path = out_dir / f"{path.stem}_crop.jpg"
@@ -256,7 +259,7 @@ def process(path: Path, out_dir: Path, args, client) -> None:
     print(f"   crop {crop.width}x{crop.height} -> {crop_path}")
 
     if args.no_ai:
-        return
+        return found
 
     frame = orient(img, data.orientation)
     context = context_line(args.location, data.date_taken)
@@ -273,23 +276,33 @@ def process(path: Path, out_dir: Path, args, client) -> None:
         result, served_by = identify(client, to_api_jpeg(crop), to_api_jpeg(frame),
                                      args.model or MODEL, context)
     (out_dir / f"{path.stem}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    found.update(result=result, model=served_by,
+                 tagged_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
     if not result.get("is_wildlife"):
         print("   no wildlife subject found; sidecar not written")
-        return
+        return found
     print(f"   {result['common_name']} ({result['scientific_name']}), "
           f"{result['rank']}, confidence {result['confidence']:.2f}")
     print(f"   {result['notes']}")
 
     if args.dry_run:
-        return
+        return found
     sidecar = xmp_sidecar.write_species(path, result, {
         "Model": served_by,
-        "TaggedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "FocusSource": "af-point" if box else "centre",
+        "TaggedAt": found["tagged_at"],
+        "FocusSource": found["focus_source"],
         "Location": args.location,
     })
     print(f"   wrote {sidecar}")
+    return found
+
+
+def write_record(path: Path | None, record: dict) -> None:
+    """--result-json: one JSON object for the Lightroom plugin, which can't see stdout."""
+    if path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def main() -> int:
@@ -307,36 +320,57 @@ def main() -> int:
                          "helps separate look-alike species")
     ap.add_argument("--claude-path", help="path to the claude executable (claude-cli backend)")
     ap.add_argument("--no-ai", action="store_true", help="only extract and crop")
-    ap.add_argument("--dry-run", action="store_true", help="call the AI but don't write sidecars")
+    ap.add_argument("--dry-run", "--no-sidecar", dest="dry_run", action="store_true",
+                    help="call the AI but don't write sidecars")
+    ap.add_argument("--result-json", type=Path,
+                    help="write the outcome for a single CR3 to this JSON file, even on failure "
+                         "(used by the Lightroom plugin)")
     args = ap.parse_args()
+
+    # Output may be redirected to a log file, where Windows defaults to cp1252 and would fail on
+    # names like "Pūkeko".
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8", errors="replace")
 
     files = []
     for p in args.paths:
         files += sorted(p.glob("*.[cC][rR]3")) if p.is_dir() else [p]
+    if args.result_json and len(files) != 1:
+        ap.error("--result-json takes exactly one CR3 file")
     if not files:
         print("No CR3 files found.")
         return 1
     args.out.mkdir(parents=True, exist_ok=True)
 
     client = None  # anthropic.Anthropic for the api backend, the claude path for claude-cli
-    if not args.no_ai:
-        if args.backend == "claude-cli":
-            client = find_claude_cli(args.claude_path)
-            print(f"Using Claude Code CLI: {client}")
-        else:
-            import anthropic
-            client = anthropic.Anthropic()
+    try:
+        if not args.no_ai:
+            if args.backend == "claude-cli":
+                client = find_claude_cli(args.claude_path)
+                print(f"Using Claude Code CLI: {client}")
+            else:
+                import anthropic
+                client = anthropic.Anthropic()
+    except Exception as e:
+        print(f"FAILED: {type(e).__name__}: {e}")
+        write_record(args.result_json, {"ok": False, "path": str(files[0].resolve()),
+                                        "error": f"{type(e).__name__}: {e}"})
+        return 1
 
     failures = 0
     for f in files:
+        record = {"ok": False, "path": str(f.resolve()), "error": None}
         try:
-            process(f, args.out, args, client)
+            record.update(process(f, args.out, args, client))
+            record["ok"] = True
         except Exception as e:  # keep going through a folder; report each failure
             failures += 1
+            record["error"] = f"{type(e).__name__}: {e}"
             print(f"   FAILED: {type(e).__name__}: {e}")
-            if client is not None and type(e).__name__ == "AuthenticationError":
-                print("   Set ANTHROPIC_API_KEY (or run `ant auth login`) and try again.")
-                break
+        write_record(args.result_json, record)
+        if record["error"] and client is not None and record["error"].startswith("AuthenticationError"):
+            print("   Set ANTHROPIC_API_KEY (or run `ant auth login`) and try again.")
+            break
     print(f"\nDone: {len(files) - failures} ok, {failures} failed.")
     return 1 if failures else 0
 

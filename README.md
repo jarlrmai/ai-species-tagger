@@ -40,7 +40,9 @@ as `aitag:Location`. It makes a big difference with look-alikes: on `1J2A2741.CR
 location the answer was Golden-fronted Woodpecker at 0.72; with it, Hoffmann's Woodpecker at 0.92.
 
 Options: `--crop-scale 0.5` sets the crop size as a fraction of the short edge.
-`--dry-run` calls the AI but writes no sidecar. `--out DIR` sets where crops and JSON go.
+`--dry-run` (or `--no-sidecar`) calls the AI but writes no sidecar. `--out DIR` sets where crops and JSON go.
+`--result-json FILE` writes the outcome for a single CR3 to one JSON file, even when it fails
+(the Lightroom plugin uses this).
 
 ## Output
 
@@ -59,6 +61,44 @@ The sidecar gets:
 If a sidecar already exists (for example from Lightroom), the fields are merged in and the
 original is copied once to `<name>.xmp.bak`. The CR3 itself is never modified.
 In Lightroom Classic, use **Metadata > Read Metadata from Files** to pick up the keywords.
+
+## Lightroom Classic plugin
+
+`lightroom/SpeciesTagger.lrplugin` tags photos straight into the catalogue: no sidecars, so
+none of the XMP sync conflicts. It runs `species_tagger.py` once per photo, with
+`--no-sidecar --result-json`.
+
+**Install:** File > Plug-in Manager > Add, and pick the `SpeciesTagger.lrplugin` folder. Leave it
+inside this repo: by default it finds `species_tagger.py` and `.venv\Scripts\python.exe` two
+folders up. Other paths, the AI backend and the confidence thresholds are set in the Plug-in
+Manager.
+
+**Use:** select photos, then **Library > Plug-in Extras > Tag Species with AI...** (or the File
+menu, which also works in Develop). Non-CR3s, virtual copies and offline files are skipped. For
+each photo the location is taken from its own IPTC location fields or GPS, falling back to what you
+type in the dialog.
+
+What it writes for each photo:
+- the keyword **Species > \<common name\>**, created if needed, with the scientific name as its
+  synonym
+- **Species > _check** as well, when the confidence is below the "flag below" threshold (0.7)
+- plugin fields: species, scientific name, rank, confidence, confidence band
+  (high/medium/low/no wildlife), notes, alternatives, location used, crop source, model and time.
+  They're shown in the **AI Species** Metadata panel preset, and confidence band works in smart
+  collections.
+
+If you tag a photo again, the previous species keyword and `_check` are replaced. Keywords you
+added yourself are left alone. Results are saved to the catalogue every 10 photos, and each save
+is one Undo step.
+
+**Cancel** from the progress bar at the top left. The photo in progress finishes first.
+
+**Logs:** `Documents\LrClassicLogs\SpeciesTagger.log` (commands run, results) and
+`%TEMP%\AISpeciesTagger\python.log` (the script's output for the latest run).
+
+Limits: Windows only so far. Paths containing non-ASCII characters may not survive Lightroom's
+`LrTasks.execute`. The API backend reads `ANTHROPIC_API_KEY` from Lightroom's environment, so set
+it before starting Lightroom.
 
 ## How the focus point is found
 
