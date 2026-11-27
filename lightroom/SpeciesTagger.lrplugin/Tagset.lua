@@ -20,6 +20,7 @@ return {
 			P .. 'alternatives',
 			P .. 'location',
 			P .. 'focusSource',
+			P .. 'identifiedFrom',
 			P .. 'model',
 			P .. 'taggedAt',
 		},

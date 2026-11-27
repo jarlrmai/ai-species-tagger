@@ -41,6 +41,10 @@ function Settings.defaults()
 		checkThreshold = 0.7,       -- below this confidence the photo also gets Species > _check
 		highThreshold = 0.9,        -- at or above this the confidence band is "high"
 		skipTagged = true,
+		reuseBursts = true,         -- frames of one burst reuse the first High-confidence ID
+		burstGap = 2,               -- seconds: frames at most this far apart are one burst
+		burstMaxSpan = 10,          -- seconds: a burst longer than this is split, to re-check
+		showConsole = false,        -- open a PowerShell window following the script's output
 		lastLocation = '',
 	}
 end

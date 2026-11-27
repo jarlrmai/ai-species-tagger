@@ -57,11 +57,24 @@ which also works in Develop). The dialog asks for:
   look-alikes: on `1J2A2741.CR3`, without one the answer was Golden-fronted Woodpecker at 0.72;
   with it, Hoffmann's Woodpecker at 0.92.
 - whether to **skip photos already tagged**
+- whether to **reuse IDs within a burst** (on by default). Photos are processed in capture order,
+  and consecutive frames from the same camera body taken at most 2 s apart count as one burst
+  (split after 10 s, so long sequences are re-checked). The first frame is identified; if the
+  answer is a High-confidence wildlife ID (0.9+ by default), the rest of the burst gets the same
+  ID with no AI call, and its **Identified from** field names the source frame. A lower-confidence
+  answer, "no wildlife" or a failure means the next frame is asked instead. The gap and span are
+  `burstGap` and `burstMaxSpan` in `Settings.lua`.
 - the **AI backend**
 
-Non-CR3s, virtual copies and offline files are skipped. Each photo takes about 10 to 40 seconds.
-**Cancel** from the progress bar at the top left; the photo in progress finishes first and
-everything done so far is kept.
+- **Show live console**: opens a PowerShell window that follows the script's output as it runs:
+  AF point, crop, which model is being asked, a "still waiting" line every 10 seconds of silence,
+  the model's thought summaries as they arrive (Gemini), then the result or the full error.
+  It closes by itself 10 seconds after the run ends, whether it succeeded or failed.
+
+Files other than CR3 and DNG, virtual copies and offline files are skipped. Each photo takes about 10 to 40 seconds.
+Progress shows in Lightroom's activity area at the top left, as "Species 3 of 20: <file>"; the
+bar moves during each photo too. **Cancel** with the × there; the photo in progress finishes
+first and everything done so far is kept.
 
 ## What it writes
 
@@ -81,8 +94,11 @@ is one Undo step.
 
 Thresholds, paths, model and backend are set in **File > Plug-in Manager**.
 
-**Logs:** `Documents\LrClassicLogs\SpeciesTagger.log` (commands run, results) and
-`%TEMP%\AISpeciesTagger\python.log` (the script's output for the latest run).
+**Logs:** `%LOCALAPPDATA%\Adobe\Lightroom\Logs\LrClassicLogs\SpeciesTagger.log` (commands run,
+results) and `%TEMP%\AISpeciesTagger\run-<date-time>\python.log` (the script's output; each run
+gets its own folder and the latest five are kept). The end-of-run message gives the exact path.
+A photo's crop and previews in the run's `output` folder are deleted once its result is in the
+catalogue, except for Low-confidence and failed photos, so you can see what the AI was shown.
 
 ## How it works
 

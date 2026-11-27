@@ -36,8 +36,8 @@ local function sectionsForTopOfDialog(f, propertyTable)
 			bind_to_object = prefs,
 
 			f:static_text {
-				title = "Runs species_tagger.py on the selected CR3s and writes keywords and fields into the catalogue.\n"
-					.. "No XMP sidecars are written. Log: Documents\\LrClassicLogs\\SpeciesTagger.log "
+				title = "Runs species_tagger.py on the selected CR3s and DNGs and writes keywords and fields into the catalogue.\n"
+					.. "No XMP sidecars are written. Log: %LOCALAPPDATA%\\Adobe\\Lightroom\\Logs\\LrClassicLogs\\SpeciesTagger.log "
 					.. "and the Python output in the plugin's temp folder (see the end-of-run message).",
 				height_in_lines = 3,
 				width_in_chars = 80,

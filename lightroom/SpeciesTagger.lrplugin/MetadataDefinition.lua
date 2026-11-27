@@ -2,7 +2,7 @@
 -- Bump schemaVersion whenever a field is added, removed or changed, or Lightroom ignores it.
 
 return {
-	schemaVersion = 1,
+	schemaVersion = 2,   -- 2: identifiedFrom
 
 	metadataFieldsForPhotos = {
 		{ id = 'commonName', title = "Species", dataType = 'string',
@@ -27,6 +27,9 @@ return {
 		{ id = 'alternatives', title = "Alternatives", dataType = 'string', searchable = true, readOnly = true },
 		{ id = 'location', title = "Location used", dataType = 'string', searchable = true, readOnly = true },
 		{ id = 'focusSource', title = "Crop centred on", dataType = 'string', readOnly = true },
+		-- Set when the ID was reused from another frame of the same burst (no AI call of its own).
+		{ id = 'identifiedFrom', title = "Identified from", dataType = 'string',
+		  searchable = true, readOnly = true },
 		{ id = 'model', title = "Model", dataType = 'string', searchable = true, readOnly = true },
 		{ id = 'taggedAt', title = "Tagged at", dataType = 'string', searchable = true, readOnly = true },
 	},
