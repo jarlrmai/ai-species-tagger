@@ -38,9 +38,11 @@ READERS = {".cr3": cr3.read_cr3, ".dng": dng.read_dng}
 MODEL = "claude-opus-5-5"
 # Tried in order; a model that is overloaded (503), times out (504) or is gone (404) is skipped for
 # the next. On a free-tier key in Nov 2026, 3.6 Flash answered reliably while the newest Flash
-# models (3.7, 3.8) were often overloaded, so it goes first. Google may retire 3.6 before the
-# others; the fallbacks cover that. --model replaces the list with one model.
-GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
+# models (3.7, 3.8) were often overloaded, so it goes first. Google may retire 3.6 before 3.8.
+# No Flash-Lite fallback: 3.5 Flash-Lite called a Crimson-collared Tanager a Flame-rumped
+# Tanager at 0.95, and a failed photo (re-run later) beats a confident wrong tag.
+# --model replaces the list with one model.
+GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash"]
 GEMINI_TIMEOUT_MS = 90_000
 MAX_API_EDGE = 1568  # longest edge sent to the API; larger images are downscaled server-side anyway
 

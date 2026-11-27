@@ -34,9 +34,11 @@ runs in real Lightroom may still turn up rough edges.
      ```
      setx GEMINI_API_KEY "..."
      ```
-     and restart Lightroom. The script tries `gemini-3.6-flash`, then `gemini-3.8-flash`, then
-     `gemini-3.5-flash-lite`, moving on when a model is overloaded, times out or has been retired.
-     3.6 goes first because the newest models are often busy on the free tier. A model in the plugin's Model field (or
+     and restart Lightroom. The script tries `gemini-3.6-flash`, then `gemini-3.8-flash`, moving
+     on when a model is overloaded, times out or has been retired. 3.6 goes first because the
+     newest models are often busy on the free tier. If both are busy the photo fails; run it again
+     later. The faster Flash-Lite models aren't used: one gave a confidently wrong species in
+     testing. A model in the plugin's Model field (or
      `--model`) replaces the list. To see the models your key can use:
      `python -c "from google import genai; [print(m.name) for m in genai.Client().models.list()]"` On the free tier, Google may use what you send (crops, full frame,
      location) to improve its products, and there are per-minute and daily limits. The script
