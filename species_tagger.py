@@ -40,6 +40,8 @@ import xmp_sidecar
 READERS = {".cr3": cr3.read_cr3, ".dng": dng.read_dng}
 
 MODEL = "claude-opus-5-5"
+# Claude Code's short model names, so the same --model works with the api backend.
+API_MODEL_ALIASES = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5-5", "haiku": "claude-haiku-5-5"}
 # Tried in order; a model that is overloaded (503), times out (504) or is gone (404) is skipped for
 # the next. On a free-tier key in Nov 2026, 3.6 Flash answered reliably while the newest Flash
 # models (3.7, 3.8) were often overloaded, so it goes first. Google may retire 3.6 before 3.8.
@@ -432,6 +434,7 @@ def process(path: Path, out_dir: Path, args, client) -> dict:
                                                 [args.model] if args.model else GEMINI_MODELS, context)
     else:
         model = args.model or MODEL
+        model = API_MODEL_ALIASES.get(model.lower(), model)
         print(f"   asking Claude ({model}) via the API")
         with heartbeat(f"Claude ({model})"):
             result, served_by = identify(client, to_api_jpeg(crop), to_api_jpeg(frame), model, context)
@@ -479,7 +482,8 @@ def main() -> int:
                     help="api: Anthropic API key (default). claude-cli: Claude Code, billed to your "
                          "subscription. gemini: Google Gemini API key (GEMINI_API_KEY), free tier available")
     ap.add_argument("--model", default=None,
-                    help=f"model id (default {MODEL} for api, 'opus' for claude-cli, "
+                    help=f"model id (default {MODEL} for api, 'opus' for claude-cli; "
+                         f"opus/sonnet/haiku work for both, "
                          f"{', then '.join(GEMINI_MODELS)} for gemini)")
     ap.add_argument("--location",
                     help='where the photos were taken, e.g. "Costa Rica" or "Costa Rica, Guanacaste"; '
