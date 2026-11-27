@@ -71,10 +71,17 @@ which also works in Develop). The dialog asks for:
   the model's thought summaries as they arrive (Gemini), then the result or the full error.
   It closes by itself 10 seconds after the run ends, whether it succeeded or failed.
 
-Files other than CR3 and DNG, virtual copies and offline files are skipped. Each photo takes about 10 to 40 seconds.
-Progress shows in Lightroom's activity area at the top left, as "Species 3 of 20: <file>"; the
-bar moves during each photo too. **Cancel** with the × there; the photo in progress finishes
-first and everything done so far is kept.
+Files other than CR3 and DNG, virtual copies and offline files are skipped. One run of the script
+handles all the photos, working on 4 at a time (**At once** in Plug-in Manager; 1 to 8). Bursts
+run in parallel, but frames within a burst wait for each other, so a burst's reuse still works.
+With the API backend and Sonnet, 79 photos took about 6 to 7 minutes one at a time; at 4 at once
+expect a quarter of that. A new API account has low rate limits: the script waits and retries
+when the API says it's busy, so a run never fails for that, but if it slows down, lower
+**At once**. In the console, each line carries the photo's name, e.g. `[1J2A2741]`.
+
+Progress shows in Lightroom's activity area at the top left, as "Species: 12 of 79 done".
+**Cancel** with the × there; photos in progress finish, no new ones start, and everything done
+so far is kept.
 
 ## What it writes
 
@@ -102,8 +109,9 @@ catalogue, except for Low-confidence and failed photos, so you can see what the 
 
 ## How it works
 
-The plugin runs `species_tagger.py` once per photo with `--no-sidecar --result-json`, reads the
-JSON result and writes it to the catalogue.
+The plugin writes a job file listing the photos (each with its location and burst), runs
+`species_tagger.py --jobs` once with `--no-sidecar`, and picks up the one-JSON-file-per-photo
+results as they appear, writing them to the catalogue every 10 photos.
 
 **Focus point.** Canon stores AF data in maker-note tag `0x0026` (AFInfo2) inside the CR3's
 `CMT3` box: the size and position of each AF area relative to the frame centre, plus bitmasks of
@@ -144,9 +152,10 @@ then compare the JSON files.
 
 Options: `--location TEXT` where you shot. `--crop-scale 0.5` sets the crop size as a fraction of
 the short edge. `--dry-run` (or `--no-sidecar`) calls the AI but writes no sidecar. `--out DIR`
-sets where crops and JSON go. `--result-json FILE` writes the outcome for a single photo to one JSON
-file, even when it fails (the plugin uses this). `--model`, `--claude-path` as in the plugin
-settings.
+sets where crops and JSON go. `--workers N` sets how many photos are worked on at once (default
+4). `--result-json FILE` writes the outcome for a single photo to one JSON file, even when it
+fails. `--jobs FILE` takes the photos from a job file instead (the plugin uses this).
+`--model`, `--claude-path` as in the plugin settings.
 
 | File | What |
 |---|---|

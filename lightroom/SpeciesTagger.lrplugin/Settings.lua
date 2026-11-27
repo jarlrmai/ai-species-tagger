@@ -38,6 +38,7 @@ function Settings.defaults()
 		                            -- or 'gemini' (GEMINI_API_KEY)
 		model = '',                 -- blank: the script's default for the backend
 		claudePath = '',            -- blank: claude on PATH, then the VS Code extension's copy
+		workers = 4,                -- photos worked on at once
 		checkThreshold = 0.7,       -- below this confidence the photo also gets Species > _check
 		highThreshold = 0.9,        -- at or above this the confidence band is "high"
 		skipTagged = true,

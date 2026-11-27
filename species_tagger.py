@@ -25,6 +25,7 @@ import sys
 import textwrap
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -282,7 +283,7 @@ def identify_gemini(client, crop_jpeg: bytes, frame_jpeg: bytes, models: list[st
             if not (timed_out or e.code in (404, 500, 502, 503, 504)) or i == len(models) - 1:
                 raise
             why = "timed out" if timed_out else f"{e.code} {e.status}"
-            print(f"   {model}: {why}, trying {models[i + 1]}")
+            log(f"   {model}: {why}, trying {models[i + 1]}")
 
 
 def _http_timeout_errors() -> tuple[type[Exception], ...]:
@@ -315,14 +316,14 @@ def _identify_gemini_once(client, crop_jpeg: bytes, frame_jpeg: bytes, model: st
             thinking_config=types.ThinkingConfig(include_thoughts=True) if thoughts else None,
         )
 
-    print(f"   asking {model}")
+    log(f"   asking {model}")
     try:
         answer, finish, version = _stream_gemini(client, model, contents, config(True))
     except errors.ClientError as e:
         if e.code != 400 or "think" not in str(e).lower():
             raise
         # A model that doesn't do thought summaries: ask again without them.
-        print(f"   {model} doesn't give thought summaries; asking without them")
+        log(f"   {model} doesn't give thought summaries; asking without them")
         answer, finish, version = _stream_gemini(client, model, contents, config(False))
     if not answer:
         raise RuntimeError(f"Gemini returned no answer ({finish or 'no candidates'})")
@@ -347,16 +348,31 @@ def _stream_gemini(client, model, contents, config):
     return "".join(answer), finish, version
 
 
-_last_progress = [0.0]  # time.monotonic() of the last progress line, so heartbeat() stays quiet
+# Per worker thread: `prefix` tags each indented line with the photo's name when several photos
+# run at once, so their lines can be told apart in the log; `last` holds time.monotonic() of the
+# photo's last progress line, so heartbeat() stays quiet while thoughts are arriving.
+_tls = threading.local()
+_print_lock = threading.Lock()
+
+
+def log(text: str = "", prefix: str | None = None) -> None:
+    """print, with the photo's tag after the indent of each indented line when one is set."""
+    prefix = getattr(_tls, "prefix", "") if prefix is None else prefix
+    lines = [f"   {prefix}{line[3:]}" if prefix and line.startswith("   ") else line
+             for line in str(text).split("\n")]
+    with _print_lock:
+        print("\n".join(lines))
 
 
 def show_thought(text: str) -> None:
     """A model's thought summary, indented under the photo in the log."""
-    _last_progress[0] = time.monotonic()
+    last = getattr(_tls, "last", None)
+    if last:
+        last[0] = time.monotonic()
     for para in text.strip().splitlines():
         para = para.strip().replace("**", "")
         if para:
-            print(textwrap.fill(para, width=100, initial_indent="   | ", subsequent_indent="   | "))
+            log(textwrap.fill(para, width=100, initial_indent="   | ", subsequent_indent="   | "))
 
 
 @contextmanager
@@ -364,14 +380,15 @@ def heartbeat(label: str, every: float = 10.0):
     """While the block runs, print '... still waiting' after each `every` seconds of silence."""
     stop = threading.Event()
     started = time.monotonic()
-    _last_progress[0] = started
+    last = _tls.last = [started]
+    prefix = getattr(_tls, "prefix", "")   # the tick thread has no _tls of its own
 
     def tick():
         while not stop.wait(1.0):
             now = time.monotonic()
-            if now - _last_progress[0] >= every:
-                _last_progress[0] = now
-                print(f"   ... still waiting for {label} ({now - started:.0f} s)")
+            if now - last[0] >= every:
+                last[0] = now
+                log(f"   ... still waiting for {label} ({now - started:.0f} s)", prefix)
 
     thread = threading.Thread(target=tick, daemon=True)
     thread.start()
@@ -384,47 +401,47 @@ def heartbeat(label: str, every: float = 10.0):
 
 # ---------------------------------------------------------------- main
 
-def process(path: Path, out_dir: Path, args, client) -> dict:
+def process(path: Path, out_dir: Path, args, client, location: str | None) -> dict:
     """Crop, identify and (unless --dry-run) write the sidecar. Returns what was found."""
-    print(f"\n== {path.name}")
+    log(f"\n== {path.name}")
     reader = READERS.get(path.suffix.lower())
     if reader is None:
         raise ValueError(f"Unsupported file type {path.suffix}; supported: {', '.join(READERS)}")
     data = reader(path)
     img = Image.open(io.BytesIO(data.jpeg))
     img.load()
-    print(f"   {data.make} {data.model}, JPEG {img.width}x{img.height}, orientation {data.orientation}")
+    log(f"   {data.make} {data.model}, JPEG {img.width}x{img.height}, orientation {data.orientation}")
 
     box = focus_box(data, img.width, img.height)
     if box:
         pts = data.af.focus_points()
-        print(f"   AF: {len(pts)} point(s), box {[int(v) for v in box]}")
+        log(f"   AF: {len(pts)} point(s), box {[int(v) for v in box]}")
     else:
-        print("   AF: no in-focus point recorded; cropping the centre")
+        log("   AF: no in-focus point recorded; cropping the centre")
     rect = crop_rect(box, img.width, img.height, args.crop_scale)
-    found = {"focus_source": "af-point" if box else "centre", "location": args.location,
+    found = {"focus_source": "af-point" if box else "centre", "location": location,
              "date_taken": data.date_taken, "result": None, "model": None, "tagged_at": None}
 
     crop = orient(img.crop(rect), data.orientation)
     crop_path = out_dir / f"{path.stem}_crop.jpg"
     crop.save(crop_path, quality=92)
     save_overlay(img, box, rect, data.orientation, out_dir / f"{path.stem}_af.jpg")
-    print(f"   crop {crop.width}x{crop.height} -> {crop_path}")
+    log(f"   crop {crop.width}x{crop.height} -> {crop_path}")
 
     if args.no_ai:
         return found
 
     frame = orient(img, data.orientation)
-    context = context_line(args.location, data.date_taken)
+    context = context_line(location, data.date_taken)
     if context:
-        print(f"   context: {context}")
+        log(f"   context: {context}")
     if args.backend == "claude-cli":
         frame_path = out_dir / f"{path.stem}_frame.jpg"
         small = frame.copy()
         small.thumbnail((MAX_API_EDGE, MAX_API_EDGE), Image.Resampling.LANCZOS)
         small.save(frame_path, quality=90)
         model = args.model or "opus"
-        print(f"   asking Claude ({model}) via Claude Code")
+        log(f"   asking Claude ({model}) via Claude Code")
         with heartbeat(f"Claude ({model})"):
             result, served_by = identify_cli(client, crop_path.resolve(), frame_path.resolve(),
                                              model, context)
@@ -435,7 +452,7 @@ def process(path: Path, out_dir: Path, args, client) -> dict:
     else:
         model = args.model or MODEL
         model = API_MODEL_ALIASES.get(model.lower(), model)
-        print(f"   asking Claude ({model}) via the API")
+        log(f"   asking Claude ({model}) via the API")
         with heartbeat(f"Claude ({model})"):
             result, served_by = identify(client, to_api_jpeg(crop), to_api_jpeg(frame), model, context)
     (out_dir / f"{path.stem}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
@@ -443,38 +460,170 @@ def process(path: Path, out_dir: Path, args, client) -> dict:
                  tagged_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
 
     if not result.get("is_wildlife"):
-        print("   no wildlife subject found; sidecar not written")
+        log("   no wildlife subject found; sidecar not written")
         return found
-    print(f"   {result['common_name']} ({result['scientific_name']}), "
+    log(f"   {result['common_name']} ({result['scientific_name']}), "
           f"{result['rank']}, confidence {result['confidence']:.2f}")
-    print(f"   {result['notes']}")
+    log(f"   {result['notes']}")
 
     if args.dry_run:
         return found
     if path.suffix.lower() == ".dng":
         # Lightroom reads a DNG's metadata from inside the file and ignores .xmp sidecars.
-        print("   DNG: sidecar not written (Lightroom ignores sidecars for DNGs; use the plugin)")
+        log("   DNG: sidecar not written (Lightroom ignores sidecars for DNGs; use the plugin)")
         return found
     sidecar = xmp_sidecar.write_species(path, result, {
         "Model": served_by,
         "TaggedAt": found["tagged_at"],
         "FocusSource": found["focus_source"],
-        "Location": args.location,
+        "Location": location,
     })
-    print(f"   wrote {sidecar}")
+    log(f"   wrote {sidecar}")
     return found
 
 
 def write_record(path: Path | None, record: dict) -> None:
-    """--result-json: one JSON object for the Lightroom plugin, which can't see stdout."""
+    """One photo's outcome as JSON, for the Lightroom plugin, which can't see stdout. Written to
+    a temporary name and renamed, so the plugin never reads a half-written file."""
     if path:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(path)
+
+
+def photo_tag(path: Path) -> str:
+    """Short label for a photo's lines in the log when several run at once."""
+    stem = path.stem
+    return f"[{stem if len(stem) <= 16 else stem[:16]}] "
+
+
+class Runner:
+    """Works through the photos with up to `workers` at a time.
+
+    Photos are grouped into bursts (the plugin decides which frames are one burst). A burst's
+    frames are asked one after another until one gets a High-confidence wildlife ID, which the
+    rest of the burst then reuses with no AI call; different bursts run in parallel."""
+
+    def __init__(self, args, client, workers: int, result_dir: Path | None = None,
+                 cancel_file: Path | None = None, high: float | None = None):
+        self.args, self.client, self.workers = args, client, workers
+        self.result_dir, self.cancel_file, self.high = result_dir, cancel_file, high
+        self.stop = threading.Event()   # a failure the rest of the run would repeat
+        self.lock = threading.Lock()
+        self.ok = self.failed = self.reused = 0
+
+    def stopping(self) -> bool:
+        return self.stop.is_set() or bool(self.cancel_file and self.cancel_file.exists())
+
+    def emit(self, job: dict, record: dict) -> None:
+        if self.result_dir:
+            write_record(self.result_dir / f"{job['id']}.json", record)
+        elif self.args.result_json:
+            write_record(self.args.result_json, record)
+        with self.lock:
+            if record.get("reused"):
+                self.reused += 1
+            elif record["ok"]:
+                self.ok += 1
+            else:
+                self.failed += 1
+
+    def run_one(self, job: dict) -> dict:
+        path = job["path"]
+        _tls.prefix = photo_tag(path) if self.workers > 1 else ""
+        record = {"ok": False, "id": job["id"], "path": str(path.resolve()), "error": None}
+        try:
+            record.update(process(path, self.args.out, self.args, self.client, job.get("location")))
+            record["ok"] = True
+        except Exception as e:  # keep going through the rest; report each failure
+            record["error"] = f"{type(e).__name__}: {e}"
+        # Record first, print second: if stdout is broken (e.g. the log can't be written), the
+        # plugin still gets the reason from the result file.
+        self.emit(job, record)
+        error = record["error"]
+        if error:
+            log(f"   FAILED: {error}")
+            if self.client is not None and error.startswith("AuthenticationError"):
+                self.halt("Set ANTHROPIC_API_KEY (or run `ant auth login`) and try again.")
+            elif self.args.backend == "gemini" and error.startswith("ClientError: 4"):
+                # 400 bad key, 403 no access, 429 quota still exhausted after the retries: the
+                # rest of the run would fail the same way.
+                self.halt("Check GEMINI_API_KEY, or the free-tier quota (it resets daily).")
+        return record
+
+    def halt(self, advice: str) -> None:
+        with self.lock:
+            first = not self.stop.is_set()
+            self.stop.set()
+        if first:
+            log(f"\nStopping: no more photos will be started. {advice}", "")
+
+    def is_high(self, record: dict) -> bool:
+        r = record.get("result")
+        return (self.high is not None and record["ok"] and bool(r) and bool(r.get("is_wildlife"))
+                and float(r.get("confidence") or 0) >= self.high)
+
+    def run_burst(self, burst: list[dict]) -> None:
+        for k, job in enumerate(burst):
+            if self.stopping():
+                return
+            record = self.run_one(job)
+            if self.is_high(record) and k + 1 < len(burst):
+                name = record["result"]["common_name"]
+                for other in burst[k + 1:]:
+                    copy = dict(record, id=other["id"], path=str(other["path"].resolve()), reused=True,
+                                identified_from=f"{job['path'].name} (same burst)")
+                    self.emit(other, copy)
+                    log(f"\n== {other['path'].name}: {name}, reused from {job['path'].name} (same burst)", "")
+                return
+
+    def run(self, jobs: list[dict]) -> None:
+        # Bursts in order of their first frame; a photo with no burst is a burst of its own.
+        bursts: dict = {}
+        for job in jobs:
+            key = job.get("burst")
+            bursts.setdefault(("b", key) if key is not None else ("p", job["id"]), []).append(job)
+        print(f"{len(jobs)} photo(s), up to {self.workers} at a time")
+        with ThreadPoolExecutor(max_workers=self.workers) as pool:
+            futures = [pool.submit(self.run_burst, b) for b in bursts.values()]
+            try:
+                for f in futures:
+                    f.result()
+            except KeyboardInterrupt:
+                self.stop.set()   # photos in progress finish; no new ones start
+                raise
+
+
+def load_jobs(path: Path) -> dict:
+    """The plugin's job file: {"results": dir, "cancel_file": path, "high_threshold": 0.9 or null,
+    "photos": [{"id": "1", "path": "...", "location": "..." or null, "burst": 3 or null}, ...]}"""
+    spec = json.loads(path.read_text(encoding="utf-8-sig"))
+    for job in spec["photos"]:
+        job["id"] = str(job["id"])
+        job["path"] = Path(job["path"])
+    return spec
+
+
+def make_client(args):
+    """anthropic.Anthropic for api, the claude path for claude-cli, genai.Client for gemini."""
+    if args.no_ai:
+        return None
+    if args.backend == "claude-cli":
+        client = find_claude_cli(args.claude_path)
+        print(f"Using Claude Code CLI: {client}")
+        return client
+    if args.backend == "gemini":
+        return gemini_client()
+    import anthropic
+    # Several photos at once can briefly exceed a new account's rate limit; the SDK waits and
+    # retries a 429 (honouring retry-after), so allow a few more tries than its default 2.
+    return anthropic.Anthropic(max_retries=6)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("paths", nargs="+", type=Path, help="CR3/DNG files or folders")
+    ap.add_argument("paths", nargs="*", type=Path, help="CR3/DNG files or folders")
     ap.add_argument("--out", type=Path, default=Path("output"), help="folder for crops and JSON (default: output)")
     ap.add_argument("--crop-scale", type=float, default=0.5,
                     help="crop side as a fraction of the image's short edge (default 0.5)")
@@ -489,12 +638,16 @@ def main() -> int:
                     help='where the photos were taken, e.g. "Costa Rica" or "Costa Rica, Guanacaste"; '
                          "helps separate look-alike species")
     ap.add_argument("--claude-path", help="path to the claude executable (claude-cli backend)")
+    ap.add_argument("--workers", type=int, default=4,
+                    help="photos to work on at once (default 4); 1 for one at a time")
     ap.add_argument("--no-ai", action="store_true", help="only extract and crop")
     ap.add_argument("--dry-run", "--no-sidecar", dest="dry_run", action="store_true",
                     help="call the AI but don't write sidecars")
     ap.add_argument("--result-json", type=Path,
-                    help="write the outcome for a single photo to this JSON file, even on failure "
-                         "(used by the Lightroom plugin)")
+                    help="write the outcome for a single photo to this JSON file, even on failure")
+    ap.add_argument("--jobs", type=Path,
+                    help="JSON job file listing the photos, each with its own location and burst, and "
+                         "a folder for one result file per photo (used by the Lightroom plugin)")
     args = ap.parse_args()
 
     # Output may be redirected to a log file, where Windows defaults to cp1252 and would fail on
@@ -502,62 +655,46 @@ def main() -> int:
     for stream in (sys.stdout, sys.stderr):
         stream.reconfigure(encoding="utf-8", errors="replace")
 
-    files = []
-    for p in args.paths:
-        files += sorted(f for f in p.iterdir() if f.suffix.lower() in READERS) if p.is_dir() else [p]
-    if args.result_json and len(files) != 1:
-        ap.error("--result-json takes exactly one photo")
-    if not files:
+    spec = {}
+    if args.jobs:
+        if args.paths or args.result_json:
+            ap.error("--jobs replaces the photo paths and --result-json")
+        spec = load_jobs(args.jobs)
+        jobs = spec["photos"]
+    else:
+        if not args.paths:
+            ap.error("give CR3/DNG files or folders, or --jobs")
+        files = []
+        for p in args.paths:
+            files += sorted(f for f in p.iterdir() if f.suffix.lower() in READERS) if p.is_dir() else [p]
+        if args.result_json and len(files) != 1:
+            ap.error("--result-json takes exactly one photo")
+        jobs = [{"id": str(i), "path": f, "location": args.location, "burst": None}
+                for i, f in enumerate(files, 1)]
+    if not jobs:
         print("No CR3 or DNG files found.")
         return 1
     args.out.mkdir(parents=True, exist_ok=True)
+    result_dir = Path(spec["results"]) if spec.get("results") else None
+    runner = Runner(args, None, max(1, min(args.workers, len(jobs))), result_dir,
+                    Path(spec["cancel_file"]) if spec.get("cancel_file") else None,
+                    spec.get("high_threshold"))
 
-    # anthropic.Anthropic for api, the claude path for claude-cli, genai.Client for gemini
-    client = None
     try:
-        if not args.no_ai:
-            if args.backend == "claude-cli":
-                client = find_claude_cli(args.claude_path)
-                print(f"Using Claude Code CLI: {client}")
-            elif args.backend == "gemini":
-                client = gemini_client()
-            else:
-                import anthropic
-                client = anthropic.Anthropic()
+        runner.client = make_client(args)
     except Exception as e:
         print(f"FAILED: {type(e).__name__}: {e}")
-        write_record(args.result_json, {"ok": False, "path": str(files[0].resolve()),
-                                        "error": f"{type(e).__name__}: {e}"})
+        for job in jobs:   # so the plugin can say why for each photo
+            runner.emit(job, {"ok": False, "id": job["id"], "path": str(job["path"].resolve()),
+                              "error": f"{type(e).__name__}: {e}"})
         return 1
 
-    failures = 0
-    for f in files:
-        record = {"ok": False, "path": str(f.resolve()), "error": None}
-        try:
-            record.update(process(f, args.out, args, client))
-            record["ok"] = True
-        except KeyboardInterrupt:
-            record["error"] = "Interrupted"
-            write_record(args.result_json, record)
-            raise
-        except Exception as e:  # keep going through a folder; report each failure
-            failures += 1
-            record["error"] = f"{type(e).__name__}: {e}"
-        # Record first, print second: if stdout is broken (e.g. the log can't be written), the
-        # plugin still gets the reason from the result file.
-        write_record(args.result_json, record)
-        if record["error"]:
-            print(f"   FAILED: {record['error']}")
-        if record["error"] and client is not None and record["error"].startswith("AuthenticationError"):
-            print("   Set ANTHROPIC_API_KEY (or run `ant auth login`) and try again.")
-            break
-        if record["error"] and args.backend == "gemini" and record["error"].startswith("ClientError: 4"):
-            # 400 bad key, 403 no access, 429 quota still exhausted after the retries: the rest
-            # of the batch would fail the same way.
-            print("   Stopping. Check GEMINI_API_KEY, or the free-tier quota (it resets daily).")
-            break
-    print(f"\nDone: {len(files) - failures} ok, {failures} failed.")
-    return 1 if failures else 0
+    runner.run(jobs)
+    not_run = len(jobs) - runner.ok - runner.failed - runner.reused
+    print(f"\nDone: {runner.ok} ok, {runner.failed} failed"
+          + (f", {runner.reused} reused from the same burst" if runner.reused else "")
+          + (f", {not_run} not started" if not_run else "") + ".")
+    return 1 if runner.failed or not_run else 0
 
 
 if __name__ == "__main__":

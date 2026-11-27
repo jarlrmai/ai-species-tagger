@@ -1,4 +1,4 @@
--- Minimal JSON decoder (Lightroom's Lua 5.1 has none). Decodes objects, arrays, strings
+-- Minimal JSON decoder and encoder (Lightroom's Lua 5.1 has none). Decodes objects, arrays, strings
 -- (including \uXXXX escapes and surrogate pairs, to UTF-8), numbers, true, false and null.
 -- null decodes to nil, so a key with a null value is simply absent from the table.
 
@@ -158,6 +158,54 @@ function Json.decode(str)
 		decodeError(str, pos, "trailing characters")
 	end
 	return value
+end
+
+---------------------------------------------------------------- encoding
+
+local ESCAPES = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
+
+local function encodeString(s)
+	s = string.gsub(s, '[%c"\\]', function(c)
+		return ESCAPES[c] or string.format('\\u%04x', string.byte(c))
+	end)
+	return '"' .. s .. '"'
+end
+
+-- Encodes strings (as UTF-8, which Lightroom's strings are), numbers, booleans and tables. A
+-- table with a [1] is an array; any other table is an object with string keys. nil is null.
+local function encodeValue(v)
+	local t = type(v)
+	if v == nil then
+		return 'null'
+	elseif t == 'boolean' then
+		return tostring(v)
+	elseif t == 'number' then
+		return string.format('%.14g', v)
+	elseif t == 'string' then
+		return encodeString(v)
+	elseif t == 'table' then
+		local out = {}
+		if v[1] ~= nil then
+			for i = 1, #v do
+				out[i] = encodeValue(v[i])
+			end
+			return '[' .. table.concat(out, ',') .. ']'
+		end
+		local keys = {}
+		for k in pairs(v) do
+			keys[#keys + 1] = tostring(k)
+		end
+		table.sort(keys)
+		for i, k in ipairs(keys) do
+			out[i] = encodeString(k) .. ':' .. encodeValue(v[k])
+		end
+		return '{' .. table.concat(out, ',') .. '}'
+	end
+	error("JSON: can't encode a " .. t, 0)
+end
+
+function Json.encode(value)
+	return encodeValue(value)
 end
 
 return Json

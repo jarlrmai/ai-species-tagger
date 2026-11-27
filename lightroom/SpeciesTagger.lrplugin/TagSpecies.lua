@@ -65,19 +65,23 @@ local function photoLocation(photo)
 	return nil
 end
 
-local function buildCommand(prefs, photoPath, resultPath, outDir, logPath, location)
+-- How many photos the script works on at once, from prefs (1 to 8).
+local function workerCount(prefs)
+	local n = math.floor(tonumber(prefs.workers) or 4)
+	return math.max(1, math.min(8, n))
+end
+
+-- One script run for the whole job file; photos, their locations and bursts are in the file.
+local function buildCommand(prefs, jobsPath, outDir, logPath)
 	local parts = {
 		-- -u: unbuffered, so the log (and the live console) shows each line as it happens
-		quoteArg(prefs.pythonPath), '-u', quoteArg(prefs.scriptPath), quoteArg(photoPath),
+		quoteArg(prefs.pythonPath), '-u', quoteArg(prefs.scriptPath),
+		'--jobs', quoteArg(jobsPath),
 		'--no-sidecar',
-		'--result-json', quoteArg(resultPath),
 		'--out', quoteArg(outDir),
 		'--backend', Settings.BACKENDS[prefs.backend] and prefs.backend or 'claude-cli',
+		'--workers', tostring(workerCount(prefs)),
 	}
-	if location and location ~= '' then
-		parts[#parts + 1] = '--location'
-		parts[#parts + 1] = quoteArg(location)
-	end
 	if trim(prefs.model) ~= '' then
 		parts[#parts + 1] = '--model'
 		parts[#parts + 1] = quoteArg(trim(prefs.model))
@@ -95,39 +99,13 @@ local function buildCommand(prefs, photoPath, resultPath, outDir, logPath, locat
 	return cmd
 end
 
-local function fileSize(path)
-	local f = io.open(path, 'rb')
-	if not f then
-		return 0
-	end
-	local size = f:seek('end')
-	f:close()
-	return size or 0
-end
-
--- How far one photo has got (0..1) and what it's doing, from what the script has written to the
--- log since `offset`. The AI call gives no progress of its own, so while waiting for it the bar
--- creeps towards 95%: about two-thirds of the way there after 20 seconds.
-local function photoStage(logPath, offset, elapsed)
-	local text = ''
-	local f = io.open(logPath, 'rb')
-	if f then
-		f:seek('set', offset)
-		text = f:read('*a') or ''
-		f:close()
-	end
-	if not string.find(text, '   crop ', 1, true) then
-		return 0.05, 'Reading the raw file'
-	end
-	return 0.2 + 0.75 * (1 - math.exp(-elapsed / 20)), 'Asking the AI'
-end
-
 -- The console closes when it reads this line, which endConsole appends when the run ends.
 local CONSOLE_END = '### AI Species Tagger: run finished ###'
 
 -- console.ps1: follow the log, colour failures and the model's thoughts, and close 10 seconds
--- after the end marker. A script file avoids quoting a long command through cmd /c.
-local CONSOLE_SCRIPT = [[
+-- after the end marker. A script file avoids quoting a long command through cmd /c. With several
+-- photos at once, each indented line has the photo's [tag] after the indent.
+local CONSOLE_SCRIPT = [=[
 $Host.UI.RawUI.WindowTitle = 'AI Species Tagger'
 Get-Content -LiteralPath '%s' -Wait -Encoding UTF8 | ForEach-Object {
     if ($_ -eq '%s') {
@@ -137,11 +115,11 @@ Get-Content -LiteralPath '%s' -Wait -Encoding UTF8 | ForEach-Object {
         exit
     }
     if ($_ -match 'FAILED|Traceback|Error') { Write-Host $_ -ForegroundColor Red }
-    elseif ($_ -match '^   \| ') { Write-Host $_ -ForegroundColor DarkCyan }
+    elseif ($_ -match '^   (\[[^\]]*\] )?\| ') { Write-Host $_ -ForegroundColor DarkCyan }
     elseif ($_ -match '^== ') { Write-Host $_ -ForegroundColor Yellow }
     else { Write-Host $_ }
 }
-]]
+]=]
 
 -- Opens a PowerShell window that follows this run's log as it's written.
 local function openConsole(workDir, logPath)
@@ -164,15 +142,6 @@ local function openConsole(workDir, logPath)
 	logger:info('Console: ' .. cmd)
 	-- Wrapped in quotes for the same cmd /c reason as in buildCommand.
 	LrTasks.execute('"' .. cmd .. '"')
-end
-
--- Adds a line of the plugin's own to the run's log (and so to the console).
-local function appendLog(logPath, text)
-	local f = io.open(logPath, 'ab')
-	if f then
-		f:write(text)
-		f:close()
-	end
 end
 
 -- Sorts `work` by capture time and, when `enabled`, numbers its bursts in c.burst: consecutive
@@ -279,39 +248,24 @@ local function newWorkDir()
 	return dir
 end
 
--- Runs the script for one photo, calling onTick(fraction, stage) about twice a second while it
--- runs. Returns the decoded result record, or nil and an error message.
-local function runTagger(prefs, photoPath, workDir, location, onTick)
-	local resultPath = LrPathUtils.child(workDir, 'result.json')
-	local outDir = LrPathUtils.child(workDir, 'output')
-	local logPath = LrPathUtils.child(workDir, 'python.log')
-	if LrFileUtils.exists(resultPath) then
-		LrFileUtils.delete(resultPath)
-	end
-
-	local cmd = buildCommand(prefs, photoPath, resultPath, outDir, logPath, location)
+-- Starts the script in its own task, so this one can collect results and update the progress
+-- bar meanwhile. The returned table's `finished` turns true, with `exitCode` set, when it exits.
+local function startScript(cmd)
+	local run = { finished = false }
 	logger:info('Running: ' .. cmd)
-	-- Run the script in its own task so this one can update the progress bar meanwhile.
-	local offset = fileSize(logPath)
-	local finished, exitCode = false, nil
 	LrTasks.startAsyncTask(function()
 		-- LrTasks.pcall, not pcall: execute yields while the script runs, and plain pcall
 		-- can't be yielded across ("Yielding is not allowed within a C or metamethod call").
 		local ok, code = LrTasks.pcall(LrTasks.execute, cmd)
-		exitCode = ok and code or ('failed to start: ' .. tostring(code))
-		finished = true
+		run.exitCode = ok and code or ('failed to start: ' .. tostring(code))
+		logger:info('Exit code: ' .. tostring(run.exitCode))
+		run.finished = true
 	end, 'AISpeciesTagger script')
-	local started = LrDate.currentTime()
-	while not finished do
-		onTick(photoStage(logPath, offset, LrDate.currentTime() - started))
-		LrTasks.sleep(0.5)
-	end
-	logger:info('Exit code: ' .. tostring(exitCode))
+	return run
+end
 
-	if not LrFileUtils.exists(resultPath) then
-		return nil, string.format("No result from the script (exit code %s). See %s",
-			tostring(exitCode), logPath)
-	end
+-- Decodes one photo's result file. Returns the record, or nil and an error message.
+local function readResult(resultPath)
 	local ok, record = pcall(Json.decode, LrFileUtils.readFile(resultPath))
 	if not ok then
 		return nil, "Couldn't read the result: " .. tostring(record)
@@ -532,8 +486,9 @@ local function askOptions(context, prefs, count, skippedText)
 		f:checkbox { title = "Show live console (the script's output, step by step)",
 			value = bind 'showConsole' },
 		f:static_text {
-			title = "Each photo takes about 10 to 40 seconds. Cancel from the progress bar at the top left:\n"
-				.. "the photo in progress finishes, and everything done so far is kept.",
+			title = string.format("Works on %d photos at a time (Plug-in Manager: At once). Cancel from the progress\n"
+				.. "bar at the top left: photos in progress finish, and everything done so far is kept.",
+				workerCount(prefs)),
 			height_in_lines = 2,
 		},
 	}
@@ -575,7 +530,7 @@ local function summary(stats, workDir)
 		lines[#lines + 1] = string.format("Skipped, file missing or offline: %d", stats.missing)
 	end
 	if stats.canceled then
-		lines[#lines + 1] = "Canceled before the end."
+		lines[#lines + 1] = string.format("Canceled: %d photo(s) not started.", stats.notStarted)
 	end
 	if #stats.failed > 0 then
 		lines[#lines + 1] = string.format("\nFailed: %d", #stats.failed)
@@ -662,7 +617,7 @@ local function tagSpecies(context)
 	end)
 
 	local stats = { high = 0, medium = 0, low = 0, none = 0, skippedTagged = 0, missing = 0,
-		reused = 0, failed = {}, canceled = false }
+		reused = 0, notStarted = 0, failed = {}, canceled = false }
 
 	local work = {}
 	for _, c in ipairs(candidates) do
@@ -693,71 +648,122 @@ local function tagSpecies(context)
 	end
 
 	markBursts(work, prefs, options.reuseBursts)
-	local confident = {}   -- burst number -> { record = ..., name = ... } of its first High ID
 
-	-- One progress scope per photo: Lightroom's activity area shows a scope's title but not its
-	-- caption, so the title is where "3 of 20: name" has to go. The bar shows the whole run.
+	-- One script run for all the photos. It works on several at once, writes results\<id>.json
+	-- for each photo as it finishes (including frames that reuse their burst's ID), and stops
+	-- starting new photos once the cancel file exists.
 	local pending = {}
-	for i, c in ipairs(work) do
-		local source = confident[c.burst]
-		if source then
-			-- Same burst as a confidently identified frame: reuse its ID, no AI call.
-			local record = {}
-			for k, v in pairs(source.record) do
-				record[k] = v
-			end
-			record.identified_from = source.name .. ' (same burst)'
-			pending[#pending + 1] = { photo = c.photo, path = c.path, record = record }
-			stats.reused = stats.reused + 1
-			local line = string.format('%s: %s, reused from %s (same burst)', fileName(c.path),
-				tostring(record.result.common_name), source.name)
-			logger:info(line)
-			appendLog(logPath, '\r\n== ' .. line .. '\r\n')
-		else
-			local progress = LrProgressScope {
-				title = string.format("Species %d of %d: %s", i, #work, fileName(c.path)),
-				functionContext = context,
-			}
-			progress:setCancelable(true)
-			progress:setPortionComplete(i - 1, #work)
-
+	if #work > 0 then
+		local resultsDir = LrPathUtils.child(workDir, 'results')
+		local cancelPath = LrPathUtils.child(workDir, 'cancel')
+		LrFileUtils.createAllDirectories(resultsDir)
+		local photos = {}
+		for i, c in ipairs(work) do
 			local location = options.usePhotoLocation and photoLocation(c.photo) or nil
 			if not location or location == '' then
 				location = trim(options.location)
 			end
+			photos[i] = { id = tostring(i), path = c.path, burst = c.burst,
+				location = location ~= '' and location or nil }
+		end
+		local jobsPath = LrPathUtils.child(workDir, 'jobs.json')
+		local jf = assert(io.open(jobsPath, 'wb'))
+		jf:write(Json.encode {
+			results = resultsDir,
+			cancel_file = cancelPath,
+			-- No threshold, no reuse: the script asks about every frame.
+			high_threshold = options.reuseBursts and (tonumber(prefs.highThreshold) or 0.9) or nil,
+			photos = photos,
+		})
+		jf:close()
 
-			local record, err = runTagger(prefs, c.path, workDir, location, function(fraction, stage)
-				progress:setPortionComplete(i - 1 + fraction, #work)
-				progress:setCaption(stage)
-				if progress:isCanceled() then
-					stats.canceled = true   -- the photo in progress still finishes and is kept
+		local run = startScript(buildCommand(prefs, jobsPath, LrPathUtils.child(workDir, 'output'), logPath))
+
+		-- Lightroom's activity area shows a scope's title but not its caption, so the count goes
+		-- in the title, and the scope is replaced whenever the count changes.
+		local done, seen, progress = 0, {}, nil
+		local function newProgress()
+			if progress then
+				progress:done()
+			end
+			local title = stats.canceled
+				and string.format("Species: canceling, %d of %d done (photos in progress finish)", done, #work)
+				or string.format("Species: %d of %d done", done, #work)
+			progress = LrProgressScope { title = title, functionContext = context }
+			progress:setCancelable(not stats.canceled)
+			progress:setPortionComplete(done, #work)
+		end
+
+		-- Picks up result files the script has written since the last look.
+		local function collect()
+			local found = false
+			for entry in LrFileUtils.directoryEntries(resultsDir) do
+				local id = string.match(LrPathUtils.leafName(entry), '^(%d+)%.json$')
+				if id and not seen[id] then
+					seen[id] = true
+					found = true
+					done = done + 1
+					local c = work[tonumber(id)]
+					local record, err = readResult(entry)
+					if c and record then
+						local r = record.result
+						if record.reused then
+							stats.reused = stats.reused + 1
+							logger:info(string.format('%s: %s, reused from %s', fileName(c.path),
+								tostring(r.common_name), tostring(record.identified_from)))
+						else
+							logger:info(string.format('%s: %s (%s) %.2f', fileName(c.path),
+								tostring(r.common_name), tostring(r.scientific_name), tonumber(r.confidence) or 0))
+						end
+						pending[#pending + 1] = { photo = c.photo, path = c.path, record = record,
+							files = not record.reused and outputFiles(workDir, c.path) or nil }
+					elseif c then
+						logger:warn(fileName(c.path) .. ': ' .. tostring(err))
+						stats.failed[#stats.failed + 1] = fileName(c.path) .. ": " .. tostring(err)
+					end
 				end
-			end)
-			if progress:isCanceled() then
+			end
+			return found
+		end
+
+		newProgress()
+		while true do
+			-- Read before collecting, so results written just before the script exits are kept.
+			local finished = run.finished
+			local changed = collect()
+			if not stats.canceled and progress:isCanceled() then
 				stats.canceled = true
-			end
-			progress:done()
-			if record then
-				local r = record.result
-				logger:info(string.format('%s: %s (%s) %.2f', fileName(c.path), tostring(r.common_name),
-					tostring(r.scientific_name), tonumber(r.confidence) or 0))
-				pending[#pending + 1] = { photo = c.photo, path = c.path, record = record,
-					files = outputFiles(workDir, c.path) }
-				-- Only a High-confidence wildlife ID is reused. Anything less (or a failure) and
-				-- the next frame of the burst is asked instead.
-				if c.burst and confidenceBand(r, prefs) == 'high' then
-					confident[c.burst] = { record = record, name = fileName(c.path) }
+				local cf = io.open(cancelPath, 'wb')
+				if cf then
+					cf:close()
 				end
-			else
-				logger:warn(fileName(c.path) .. ': ' .. tostring(err))
-				stats.failed[#stats.failed + 1] = fileName(c.path) .. ": " .. tostring(err)
+				logger:info('Canceled: photos in progress finish, no new ones start')
+				changed = true
 			end
+			if #pending >= WRITE_EVERY or (finished and #pending > 0) then
+				flush(catalog, pending, keywords, prefs, stats)
+			end
+			if finished then
+				break
+			end
+			if changed then
+				newProgress()
+			end
+			LrTasks.sleep(0.25)
 		end
-		if #pending >= WRITE_EVERY then
-			flush(catalog, pending, keywords, prefs, stats)
-		end
-		if stats.canceled then
-			break
+		progress:done()
+
+		for i, c in ipairs(work) do
+			if not seen[tostring(i)] then
+				if stats.canceled then
+					stats.notStarted = stats.notStarted + 1
+				else
+					-- e.g. the script stopped after a bad API key, or didn't start at all
+					stats.failed[#stats.failed + 1] = string.format(
+						"%s: not done, the script stopped early (exit code %s); see the Python output",
+						fileName(c.path), tostring(run.exitCode))
+				end
+			end
 		end
 	end
 	flush(catalog, pending, keywords, prefs, stats)

@@ -59,6 +59,11 @@ local function sectionsForTopOfDialog(f, propertyTable)
 				f:edit_field { value = bind 'model', width_in_chars = 25, immediate = true },
 				f:static_text { title = "blank = the script's default" },
 			},
+			f:row {
+				f:static_text { title = "At once:", alignment = 'right', width = share 'labelWidth' },
+				f:edit_field { value = bind 'workers', min = 1, max = 8, precision = 0, width_in_chars = 3 },
+				f:static_text { title = "photos worked on at the same time (1 = one after another)" },
+			},
 
 			f:row {
 				f:static_text { title = "Flag below:", alignment = 'right', width = share 'labelWidth' },
