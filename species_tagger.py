@@ -1,7 +1,7 @@
 """AI species tagger (proof of concept).
 
-For each Canon CR3:
-  1. pull the full-size embedded JPEG and the AF points out of the raw
+For each Canon CR3 or DNG (e.g. from DxO PureRAW):
+  1. pull the largest embedded JPEG and the AF points out of the raw
   2. crop around the in-focus AF point(s)
   3. ask Claude (or Gemini) to identify the species
   4. write the result to an XMP sidecar next to the raw
@@ -28,7 +28,12 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 import cr3
+import dng
 import xmp_sidecar
+
+# Raw formats this script reads, by extension. DNG AF points come from Canon maker notes the
+# converter kept; other cameras' DNGs fall back to a centre crop.
+READERS = {".cr3": cr3.read_cr3, ".dng": dng.read_dng}
 
 MODEL = "claude-opus-5-5"
 # Tried in order; a model that is overloaded (503), times out (504) or is gone (404) is skipped for
@@ -314,7 +319,10 @@ def _identify_gemini_once(client, crop_jpeg: bytes, frame_jpeg: bytes, model: st
 def process(path: Path, out_dir: Path, args, client) -> dict:
     """Crop, identify and (unless --dry-run) write the sidecar. Returns what was found."""
     print(f"\n== {path.name}")
-    data = cr3.read_cr3(path)
+    reader = READERS.get(path.suffix.lower())
+    if reader is None:
+        raise ValueError(f"Unsupported file type {path.suffix}; supported: {', '.join(READERS)}")
+    data = reader(path)
     img = Image.open(io.BytesIO(data.jpeg))
     img.load()
     print(f"   {data.make} {data.model}, JPEG {img.width}x{img.height}, orientation {data.orientation}")
@@ -368,6 +376,10 @@ def process(path: Path, out_dir: Path, args, client) -> dict:
 
     if args.dry_run:
         return found
+    if path.suffix.lower() == ".dng":
+        # Lightroom reads a DNG's metadata from inside the file and ignores .xmp sidecars.
+        print("   DNG: sidecar not written (Lightroom ignores sidecars for DNGs; use the plugin)")
+        return found
     sidecar = xmp_sidecar.write_species(path, result, {
         "Model": served_by,
         "TaggedAt": found["tagged_at"],
@@ -387,7 +399,7 @@ def write_record(path: Path | None, record: dict) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("paths", nargs="+", type=Path, help="CR3 files or folders")
+    ap.add_argument("paths", nargs="+", type=Path, help="CR3/DNG files or folders")
     ap.add_argument("--out", type=Path, default=Path("output"), help="folder for crops and JSON (default: output)")
     ap.add_argument("--crop-scale", type=float, default=0.5,
                     help="crop side as a fraction of the image's short edge (default 0.5)")
@@ -405,7 +417,7 @@ def main() -> int:
     ap.add_argument("--dry-run", "--no-sidecar", dest="dry_run", action="store_true",
                     help="call the AI but don't write sidecars")
     ap.add_argument("--result-json", type=Path,
-                    help="write the outcome for a single CR3 to this JSON file, even on failure "
+                    help="write the outcome for a single photo to this JSON file, even on failure "
                          "(used by the Lightroom plugin)")
     args = ap.parse_args()
 
@@ -416,11 +428,11 @@ def main() -> int:
 
     files = []
     for p in args.paths:
-        files += sorted(p.glob("*.[cC][rR]3")) if p.is_dir() else [p]
+        files += sorted(f for f in p.iterdir() if f.suffix.lower() in READERS) if p.is_dir() else [p]
     if args.result_json and len(files) != 1:
-        ap.error("--result-json takes exactly one CR3 file")
+        ap.error("--result-json takes exactly one photo")
     if not files:
-        print("No CR3 files found.")
+        print("No CR3 or DNG files found.")
         return 1
     args.out.mkdir(parents=True, exist_ok=True)
 

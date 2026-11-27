@@ -1,7 +1,7 @@
 # AI Species Tagger for Lightroom Classic
 
 A Lightroom Classic plugin that identifies the wildlife in your photos with Claude (or Google Gemini) and tags it
-in the catalogue. For each selected Canon CR3, it crops around the in-focus AF point, sends the crop
+in the catalogue. For each selected Canon CR3 (or DNG, e.g. from DxO PureRAW), it crops around the in-focus AF point, sends the crop
 and the full frame to Claude, and adds a **Species > \<common name\>** keyword plus searchable
 fields: scientific name, confidence, field-mark notes, alternatives and more.
 
@@ -43,7 +43,7 @@ runs in real Lightroom may still turn up rough edges.
      waits and retries when it hits a per-minute limit, and stops the batch when the daily quota
      runs out.
 
-ExifTool is **not** required: the CR3 is parsed directly in `cr3.py`.
+ExifTool is **not** required: CR3s are parsed directly in `cr3.py` and DNGs in `dng.py`.
 
 ## Use
 
@@ -93,6 +93,12 @@ the points that were in focus and the points that were selected. The script take
 points (or the selected ones if none achieved focus) and centres a square crop on them. With no AF
 data, it falls back to the centre.
 
+**DNG.** The largest embedded JPEG preview is used (DxO PureRAW embeds a full-size one). DNG
+converters such as DxO PureRAW and Adobe DNG Converter keep the camera's original maker notes in
+the DNG's private data, so for Canon the same AF data is read from there. Checked on a DxO PureRAW
+5 DNG from the R5: the AF point lands on the eye, as in the CR3. DNGs from other makes get a
+centre crop.
+
 On the R5, a positive Y position means up. This was checked on `1J2A3101.CR3`: the in-focus
 Eye Detection AF point lands on the dove's eye. Other Canon bodies may differ.
 
@@ -109,7 +115,7 @@ python species_tagger.py 1J2A3101.CR3 --no-ai    # check the crop first, no AI c
 python species_tagger.py 1J2A3101.CR3 --backend claude-cli   # using your Claude subscription
 python species_tagger.py 1J2A3101.CR3 --backend gemini       # using GEMINI_API_KEY
 python species_tagger.py 1J2A3101.CR3            # identify via API key + write 1J2A3101.xmp
-python species_tagger.py D:\Photos\Birds --location "Costa Rica"   # every CR3 in a folder
+python species_tagger.py D:\Photos\Birds --location "Costa Rica"   # every CR3 and DNG in a folder
 ```
 
 On the command line the default backend is the Claude API key; add `--backend claude-cli` to use
@@ -120,7 +126,7 @@ then compare the JSON files.
 
 Options: `--location TEXT` where you shot. `--crop-scale 0.5` sets the crop size as a fraction of
 the short edge. `--dry-run` (or `--no-sidecar`) calls the AI but writes no sidecar. `--out DIR`
-sets where crops and JSON go. `--result-json FILE` writes the outcome for a single CR3 to one JSON
+sets where crops and JSON go. `--result-json FILE` writes the outcome for a single photo to one JSON
 file, even when it fails (the plugin uses this). `--model`, `--claude-path` as in the plugin
 settings.
 
@@ -134,7 +140,8 @@ settings.
 The sidecar gets `dc:subject` keywords (common and scientific name), `lr:hierarchicalSubject`
 `Species|<common name>`, and `aitag:*` fields (names, rank, confidence, notes, alternatives,
 model, time). An existing sidecar is merged into, and the original is copied once to
-`<name>.xmp.bak`. The CR3 itself is never modified.
+`<name>.xmp.bak`. The raw file itself is never modified. No sidecar is written
+for a DNG: Lightroom reads a DNG's metadata from inside the file and ignores sidecars.
 
 **Don't use sidecar mode on photos in a Lightroom catalogue; use the plugin.** Lightroom treats
 its catalogue as the master copy. **Metadata > Read Metadata from Files** replaces the catalogue's
@@ -144,7 +151,7 @@ the AI keywords.
 
 ## Known limits
 
-- CR3 only. Only the Canon R5 has been checked. Mirrored EXIF orientations (2, 4, 5, 7) are
+- CR3 and DNG only; AF points for Canon only. Only the Canon R5 has been checked. Mirrored EXIF orientations (2, 4, 5, 7) are
   ignored.
 - The plugin is Windows only. Paths containing non-ASCII characters may not survive Lightroom's
   `LrTasks.execute`.

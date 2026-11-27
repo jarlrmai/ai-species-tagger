@@ -1,5 +1,5 @@
 -- AI Species Tagger: Lightroom Classic plugin.
--- Runs species_tagger.py on the selected CR3s and writes the result straight into the catalogue
+-- Runs species_tagger.py on the selected CR3s and DNGs and writes the result straight into the catalogue
 -- (keywords + plugin metadata fields). No XMP sidecars are written.
 
 return {
