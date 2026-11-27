@@ -22,6 +22,10 @@ import json
 import shutil
 import subprocess
 import sys
+import textwrap
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -291,29 +295,89 @@ def _http_timeout_errors() -> tuple[type[Exception], ...]:
 
 
 def _identify_gemini_once(client, crop_jpeg: bytes, frame_jpeg: bytes, model: str, context: str):
-    from google.genai import types
-    response = client.models.generate_content(
-        model=model,
-        contents=[
-            "Image 1: crop around the focus point.",
-            types.Part.from_bytes(data=crop_jpeg, mime_type="image/jpeg"),
-            "Image 2: the whole frame.",
-            types.Part.from_bytes(data=frame_jpeg, mime_type="image/jpeg"),
-            f"{context}\nIdentify the subject.".strip(),
-        ],
-        config=types.GenerateContentConfig(
+    """Streams the answer so the model's thought summaries can be shown as they arrive."""
+    from google.genai import errors, types
+    contents = [
+        "Image 1: crop around the focus point.",
+        types.Part.from_bytes(data=crop_jpeg, mime_type="image/jpeg"),
+        "Image 2: the whole frame.",
+        types.Part.from_bytes(data=frame_jpeg, mime_type="image/jpeg"),
+        f"{context}\nIdentify the subject.".strip(),
+    ]
+
+    def config(thoughts: bool):
+        return types.GenerateContentConfig(
             system_instruction=SYSTEM_PROMPT,
             response_mime_type="application/json",
             response_json_schema=RESULT_SCHEMA,
-        ),
-    )
-    feedback = response.prompt_feedback
-    if feedback and feedback.block_reason:
-        raise RuntimeError(f"Gemini blocked the request: {feedback.block_reason}")
-    if not response.text:
-        reason = response.candidates[0].finish_reason if response.candidates else "no candidates"
-        raise RuntimeError(f"Gemini returned no answer ({reason})")
-    return json.loads(response.text), f"gemini:{response.model_version or model}"
+            thinking_config=types.ThinkingConfig(include_thoughts=True) if thoughts else None,
+        )
+
+    print(f"   asking {model}")
+    try:
+        answer, finish, version = _stream_gemini(client, model, contents, config(True))
+    except errors.ClientError as e:
+        if e.code != 400 or "think" not in str(e).lower():
+            raise
+        # A model that doesn't do thought summaries: ask again without them.
+        print(f"   {model} doesn't give thought summaries; asking without them")
+        answer, finish, version = _stream_gemini(client, model, contents, config(False))
+    if not answer:
+        raise RuntimeError(f"Gemini returned no answer ({finish or 'no candidates'})")
+    return json.loads(answer), f"gemini:{version or model}"
+
+
+def _stream_gemini(client, model, contents, config):
+    """(answer text, finish reason, model version), printing thought summaries as they arrive."""
+    answer, finish, version = [], None, None
+    for chunk in client.models.generate_content_stream(model=model, contents=contents, config=config):
+        feedback = chunk.prompt_feedback
+        if feedback and feedback.block_reason:
+            raise RuntimeError(f"Gemini blocked the request: {feedback.block_reason}")
+        version = chunk.model_version or version
+        for cand in chunk.candidates or []:
+            finish = cand.finish_reason or finish
+            for part in (cand.content.parts if cand.content and cand.content.parts else []):
+                if part.thought and part.text:
+                    show_thought(part.text)
+                elif part.text:
+                    answer.append(part.text)
+    return "".join(answer), finish, version
+
+
+_last_progress = [0.0]  # time.monotonic() of the last progress line, so heartbeat() stays quiet
+
+
+def show_thought(text: str) -> None:
+    """A model's thought summary, indented under the photo in the log."""
+    _last_progress[0] = time.monotonic()
+    for para in text.strip().splitlines():
+        para = para.strip().replace("**", "")
+        if para:
+            print(textwrap.fill(para, width=100, initial_indent="   | ", subsequent_indent="   | "))
+
+
+@contextmanager
+def heartbeat(label: str, every: float = 10.0):
+    """While the block runs, print '... still waiting' after each `every` seconds of silence."""
+    stop = threading.Event()
+    started = time.monotonic()
+    _last_progress[0] = started
+
+    def tick():
+        while not stop.wait(1.0):
+            now = time.monotonic()
+            if now - _last_progress[0] >= every:
+                _last_progress[0] = now
+                print(f"   ... still waiting for {label} ({now - started:.0f} s)")
+
+    thread = threading.Thread(target=tick, daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join()
 
 
 # ---------------------------------------------------------------- main
@@ -357,14 +421,20 @@ def process(path: Path, out_dir: Path, args, client) -> dict:
         small = frame.copy()
         small.thumbnail((MAX_API_EDGE, MAX_API_EDGE), Image.Resampling.LANCZOS)
         small.save(frame_path, quality=90)
-        result, served_by = identify_cli(client, crop_path.resolve(), frame_path.resolve(),
-                                         args.model or "opus", context)
+        model = args.model or "opus"
+        print(f"   asking Claude ({model}) via Claude Code")
+        with heartbeat(f"Claude ({model})"):
+            result, served_by = identify_cli(client, crop_path.resolve(), frame_path.resolve(),
+                                             model, context)
     elif args.backend == "gemini":
-        result, served_by = identify_gemini(client, api_jpeg_bytes(crop), api_jpeg_bytes(frame),
-                                            [args.model] if args.model else GEMINI_MODELS, context)
+        with heartbeat("Gemini"):
+            result, served_by = identify_gemini(client, api_jpeg_bytes(crop), api_jpeg_bytes(frame),
+                                                [args.model] if args.model else GEMINI_MODELS, context)
     else:
-        result, served_by = identify(client, to_api_jpeg(crop), to_api_jpeg(frame),
-                                     args.model or MODEL, context)
+        model = args.model or MODEL
+        print(f"   asking Claude ({model}) via the API")
+        with heartbeat(f"Claude ({model})"):
+            result, served_by = identify(client, to_api_jpeg(crop), to_api_jpeg(frame), model, context)
     (out_dir / f"{path.stem}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     found.update(result=result, model=served_by,
                  tagged_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
