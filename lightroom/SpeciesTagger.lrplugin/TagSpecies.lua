@@ -66,7 +66,7 @@ local function buildCommand(prefs, photoPath, resultPath, outDir, logPath, locat
 		'--no-sidecar',
 		'--result-json', quoteArg(resultPath),
 		'--out', quoteArg(outDir),
-		'--backend', prefs.backend == 'api' and 'api' or 'claude-cli',
+		'--backend', Settings.BACKENDS[prefs.backend] and prefs.backend or 'claude-cli',
 	}
 	if location and location ~= '' then
 		parts[#parts + 1] = '--location'
@@ -76,7 +76,7 @@ local function buildCommand(prefs, photoPath, resultPath, outDir, logPath, locat
 		parts[#parts + 1] = '--model'
 		parts[#parts + 1] = quoteArg(trim(prefs.model))
 	end
-	if prefs.backend ~= 'api' and trim(prefs.claudePath) ~= '' then
+	if prefs.backend == 'claude-cli' and trim(prefs.claudePath) ~= '' then
 		parts[#parts + 1] = '--claude-path'
 		parts[#parts + 1] = quoteArg(trim(prefs.claudePath))
 	end
@@ -306,10 +306,7 @@ local function askOptions(context, prefs, count, skippedText)
 			f:static_text { title = "AI backend:" },
 			f:popup_menu {
 				value = bind 'backend',
-				items = {
-					{ title = "Claude subscription (Claude Code CLI)", value = 'claude-cli' },
-					{ title = "API key (ANTHROPIC_API_KEY)", value = 'api' },
-				},
+				items = Settings.backendItems(),
 			},
 		},
 		f:static_text {

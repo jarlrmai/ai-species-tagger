@@ -1,6 +1,6 @@
 # AI Species Tagger for Lightroom Classic
 
-A Lightroom Classic plugin that identifies the wildlife in your photos with Claude and tags it
+A Lightroom Classic plugin that identifies the wildlife in your photos with Claude (or Google Gemini) and tags it
 in the catalogue. For each selected Canon CR3, it crops around the in-focus AF point, sends the crop
 and the full frame to Claude, and adds a **Species > \<common name\>** keyword plus searchable
 fields: scientific name, confidence, field-mark notes, alternatives and more.
@@ -30,6 +30,18 @@ runs in real Lightroom may still turn up rough edges.
      setx ANTHROPIC_API_KEY "sk-ant-..."
      ```
      Then restart Lightroom so it picks up the variable.
+   - **Google Gemini** (free tier available): get a key at aistudio.google.com, then
+     ```
+     setx GEMINI_API_KEY "..."
+     ```
+     and restart Lightroom. The script tries `gemini-3.6-flash`, then `gemini-3.8-flash`, then
+     `gemini-3.5-flash-lite`, moving on when a model is overloaded, times out or has been retired.
+     3.6 goes first because the newest models are often busy on the free tier. A model in the plugin's Model field (or
+     `--model`) replaces the list. To see the models your key can use:
+     `python -c "from google import genai; [print(m.name) for m in genai.Client().models.list()]"` On the free tier, Google may use what you send (crops, full frame,
+     location) to improve its products, and there are per-minute and daily limits. The script
+     waits and retries when it hits a per-minute limit, and stops the batch when the daily quota
+     runs out.
 
 ExifTool is **not** required: the CR3 is parsed directly in `cr3.py`.
 
@@ -95,12 +107,16 @@ along with the location, so range and season can separate look-alikes.
 ```
 python species_tagger.py 1J2A3101.CR3 --no-ai    # check the crop first, no AI call
 python species_tagger.py 1J2A3101.CR3 --backend claude-cli   # using your Claude subscription
+python species_tagger.py 1J2A3101.CR3 --backend gemini       # using GEMINI_API_KEY
 python species_tagger.py 1J2A3101.CR3            # identify via API key + write 1J2A3101.xmp
 python species_tagger.py D:\Photos\Birds --location "Costa Rica"   # every CR3 in a folder
 ```
 
-On the command line the default backend is the API key; add `--backend claude-cli` to use your
-subscription.
+On the command line the default backend is the Claude API key; add `--backend claude-cli` to use
+your subscription, or `--backend gemini` for Google Gemini.
+
+To compare backends on the same photos, run each with `--dry-run` and its own `--out` folder,
+then compare the JSON files.
 
 Options: `--location TEXT` where you shot. `--crop-scale 0.5` sets the crop size as a fraction of
 the short edge. `--dry-run` (or `--no-sidecar`) calls the AI but writes no sidecar. `--out DIR`

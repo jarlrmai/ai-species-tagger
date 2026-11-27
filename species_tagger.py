@@ -3,13 +3,14 @@
 For each Canon CR3:
   1. pull the full-size embedded JPEG and the AF points out of the raw
   2. crop around the in-focus AF point(s)
-  3. ask Claude to identify the species
+  3. ask Claude (or Gemini) to identify the species
   4. write the result to an XMP sidecar next to the raw
 
 Usage:
   python species_tagger.py 1J2A3101.CR3
   python species_tagger.py D:\\Photos\\2026-01-26 --out output
   python species_tagger.py 1J2A3101.CR3 --no-ai      # crop only, no API call, no sidecar
+  python species_tagger.py 1J2A3101.CR3 --backend gemini   # Google Gemini (GEMINI_API_KEY)
 """
 
 from __future__ import annotations
@@ -30,6 +31,12 @@ import cr3
 import xmp_sidecar
 
 MODEL = "claude-opus-5-5"
+# Tried in order; a model that is overloaded (503), times out (504) or is gone (404) is skipped for
+# the next. On a free-tier key in Nov 2026, 3.6 Flash answered reliably while the newest Flash
+# models (3.7, 3.8) were often overloaded, so it goes first. Google may retire 3.6 before the
+# others; the fallbacks cover that. --model replaces the list with one model.
+GEMINI_MODELS = ["gemini-3.6-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite"]
+GEMINI_TIMEOUT_MS = 90_000
 MAX_API_EDGE = 1568  # longest edge sent to the API; larger images are downscaled server-side anyway
 
 SYSTEM_PROMPT = """You are an expert field naturalist identifying wildlife in photographs.
@@ -129,12 +136,16 @@ def orient(img: Image.Image, orientation: int) -> Image.Image:
     return img.transpose(op) if op else img
 
 
-def to_api_jpeg(img: Image.Image) -> str:
+def api_jpeg_bytes(img: Image.Image) -> bytes:
     img = img.copy()
     img.thumbnail((MAX_API_EDGE, MAX_API_EDGE), Image.Resampling.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, "JPEG", quality=90)
-    return base64.standard_b64encode(buf.getvalue()).decode("ascii")
+    return buf.getvalue()
+
+
+def to_api_jpeg(img: Image.Image) -> str:
+    return base64.standard_b64encode(api_jpeg_bytes(img)).decode("ascii")
 
 
 def save_overlay(img: Image.Image, box, rect, orientation: int, path: Path) -> None:
@@ -232,6 +243,72 @@ def identify(client, crop_b64: str, frame_b64: str, model: str, context: str = "
     return json.loads(text), response.model
 
 
+# ---------------------------------------------------------------- Gemini
+
+def gemini_client():
+    """Client for the Gemini API; the key comes from GEMINI_API_KEY (or GOOGLE_API_KEY)."""
+    from google import genai
+    from google.genai import types
+    # Free-tier limits are per minute as well as per day: wait out a 429 (10 + 20 + 40 s), which
+    # covers the per-minute window. Overload (503/504) isn't retried here: identify_gemini moves
+    # on to the next model instead, which is much faster than waiting for a busy one.
+    retry = types.HttpRetryOptions(attempts=4, initial_delay=10.0, max_delay=60.0,
+                                   http_status_codes=[429])
+    return genai.Client(http_options=types.HttpOptions(retry_options=retry, timeout=GEMINI_TIMEOUT_MS))
+
+
+def identify_gemini(client, crop_jpeg: bytes, frame_jpeg: bytes, models: list[str], context: str = ""):
+    """Try each model in turn; skip one that is overloaded, timed out or not available."""
+    from google.genai import errors
+    timeouts = _http_timeout_errors()
+    for i, model in enumerate(models):
+        try:
+            return _identify_gemini_once(client, crop_jpeg, frame_jpeg, model, context)
+        except (errors.APIError, *timeouts) as e:
+            timed_out = isinstance(e, timeouts)
+            if not (timed_out or e.code in (404, 500, 502, 503, 504)) or i == len(models) - 1:
+                raise
+            why = "timed out" if timed_out else f"{e.code} {e.status}"
+            print(f"   {model}: {why}, trying {models[i + 1]}")
+
+
+def _http_timeout_errors() -> tuple[type[Exception], ...]:
+    """The client-side timeout exceptions google-genai can raise (it uses httpx or httpx2)."""
+    found = []
+    for name in ("httpx2", "httpx"):
+        try:
+            found.append(__import__(name).TimeoutException)
+        except ImportError:
+            pass
+    return tuple(found)
+
+
+def _identify_gemini_once(client, crop_jpeg: bytes, frame_jpeg: bytes, model: str, context: str):
+    from google.genai import types
+    response = client.models.generate_content(
+        model=model,
+        contents=[
+            "Image 1: crop around the focus point.",
+            types.Part.from_bytes(data=crop_jpeg, mime_type="image/jpeg"),
+            "Image 2: the whole frame.",
+            types.Part.from_bytes(data=frame_jpeg, mime_type="image/jpeg"),
+            f"{context}\nIdentify the subject.".strip(),
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            response_mime_type="application/json",
+            response_json_schema=RESULT_SCHEMA,
+        ),
+    )
+    feedback = response.prompt_feedback
+    if feedback and feedback.block_reason:
+        raise RuntimeError(f"Gemini blocked the request: {feedback.block_reason}")
+    if not response.text:
+        reason = response.candidates[0].finish_reason if response.candidates else "no candidates"
+        raise RuntimeError(f"Gemini returned no answer ({reason})")
+    return json.loads(response.text), f"gemini:{response.model_version or model}"
+
+
 # ---------------------------------------------------------------- main
 
 def process(path: Path, out_dir: Path, args, client) -> dict:
@@ -272,6 +349,9 @@ def process(path: Path, out_dir: Path, args, client) -> dict:
         small.save(frame_path, quality=90)
         result, served_by = identify_cli(client, crop_path.resolve(), frame_path.resolve(),
                                          args.model or "opus", context)
+    elif args.backend == "gemini":
+        result, served_by = identify_gemini(client, api_jpeg_bytes(crop), api_jpeg_bytes(frame),
+                                            [args.model] if args.model else GEMINI_MODELS, context)
     else:
         result, served_by = identify(client, to_api_jpeg(crop), to_api_jpeg(frame),
                                      args.model or MODEL, context)
@@ -311,10 +391,12 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=Path("output"), help="folder for crops and JSON (default: output)")
     ap.add_argument("--crop-scale", type=float, default=0.5,
                     help="crop side as a fraction of the image's short edge (default 0.5)")
-    ap.add_argument("--backend", choices=["api", "claude-cli"], default="api",
-                    help="api: Anthropic API key (default). claude-cli: Claude Code, billed to your subscription")
+    ap.add_argument("--backend", choices=["api", "claude-cli", "gemini"], default="api",
+                    help="api: Anthropic API key (default). claude-cli: Claude Code, billed to your "
+                         "subscription. gemini: Google Gemini API key (GEMINI_API_KEY), free tier available")
     ap.add_argument("--model", default=None,
-                    help=f"model id (default {MODEL} for api, 'opus' for claude-cli)")
+                    help=f"model id (default {MODEL} for api, 'opus' for claude-cli, "
+                         f"{', then '.join(GEMINI_MODELS)} for gemini)")
     ap.add_argument("--location",
                     help='where the photos were taken, e.g. "Costa Rica" or "Costa Rica, Guanacaste"; '
                          "helps separate look-alike species")
@@ -342,12 +424,15 @@ def main() -> int:
         return 1
     args.out.mkdir(parents=True, exist_ok=True)
 
-    client = None  # anthropic.Anthropic for the api backend, the claude path for claude-cli
+    # anthropic.Anthropic for api, the claude path for claude-cli, genai.Client for gemini
+    client = None
     try:
         if not args.no_ai:
             if args.backend == "claude-cli":
                 client = find_claude_cli(args.claude_path)
                 print(f"Using Claude Code CLI: {client}")
+            elif args.backend == "gemini":
+                client = gemini_client()
             else:
                 import anthropic
                 client = anthropic.Anthropic()
@@ -370,6 +455,11 @@ def main() -> int:
         write_record(args.result_json, record)
         if record["error"] and client is not None and record["error"].startswith("AuthenticationError"):
             print("   Set ANTHROPIC_API_KEY (or run `ant auth login`) and try again.")
+            break
+        if record["error"] and args.backend == "gemini" and record["error"].startswith("ClientError: 4"):
+            # 400 bad key, 403 no access, 429 quota still exhausted after the retries: the rest
+            # of the batch would fail the same way.
+            print("   Stopping. Check GEMINI_API_KEY, or the free-tier quota (it resets daily).")
             break
     print(f"\nDone: {len(files) - failures} ok, {failures} failed.")
     return 1 if failures else 0

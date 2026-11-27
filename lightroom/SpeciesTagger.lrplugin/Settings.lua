@@ -6,6 +6,25 @@ local LrPrefs = import 'LrPrefs'
 
 local Settings = {}
 
+-- The script's --backend values, in menu order.
+local BACKEND_LIST = {
+	{ title = "Claude subscription (Claude Code CLI)", value = 'claude-cli' },
+	{ title = "Claude API key (ANTHROPIC_API_KEY)", value = 'api' },
+	{ title = "Google Gemini API key (GEMINI_API_KEY)", value = 'gemini' },
+}
+Settings.BACKENDS = {}
+for _, b in ipairs(BACKEND_LIST) do
+	Settings.BACKENDS[b.value] = true
+end
+
+function Settings.backendItems()
+	local items = {}
+	for i, b in ipairs(BACKEND_LIST) do
+		items[i] = { title = b.title, value = b.value }
+	end
+	return items
+end
+
 local function repoRoot()
 	return LrPathUtils.parent(LrPathUtils.parent(_PLUGIN.path))
 end
@@ -15,7 +34,8 @@ function Settings.defaults()
 	return {
 		pythonPath = LrPathUtils.child(LrPathUtils.child(LrPathUtils.child(root, '.venv'), 'Scripts'), 'python.exe'),
 		scriptPath = LrPathUtils.child(root, 'species_tagger.py'),
-		backend = 'claude-cli',     -- 'claude-cli' (Claude subscription) or 'api' (ANTHROPIC_API_KEY)
+		backend = 'claude-cli',     -- 'claude-cli' (Claude subscription), 'api' (ANTHROPIC_API_KEY)
+		                            -- or 'gemini' (GEMINI_API_KEY)
 		model = '',                 -- blank: the script's default for the backend
 		claudePath = '',            -- blank: claude on PATH, then the VS Code extension's copy
 		checkThreshold = 0.7,       -- below this confidence the photo also gets Species > _check

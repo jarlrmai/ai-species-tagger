@@ -50,10 +50,7 @@ local function sectionsForTopOfDialog(f, propertyTable)
 				f:static_text { title = "AI backend:", alignment = 'right', width = share 'labelWidth' },
 				f:popup_menu {
 					value = bind 'backend',
-					items = {
-						{ title = "Claude subscription (Claude Code CLI)", value = 'claude-cli' },
-						{ title = "API key (ANTHROPIC_API_KEY)", value = 'api' },
-					},
+					items = Settings.backendItems(),
 				},
 			},
 			pathRow("Claude CLI:", 'claudePath', "Choose claude.exe (leave blank to find it automatically)"),
