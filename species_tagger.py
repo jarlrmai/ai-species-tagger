@@ -462,11 +462,18 @@ def main() -> int:
         try:
             record.update(process(f, args.out, args, client))
             record["ok"] = True
+        except KeyboardInterrupt:
+            record["error"] = "Interrupted"
+            write_record(args.result_json, record)
+            raise
         except Exception as e:  # keep going through a folder; report each failure
             failures += 1
             record["error"] = f"{type(e).__name__}: {e}"
-            print(f"   FAILED: {type(e).__name__}: {e}")
+        # Record first, print second: if stdout is broken (e.g. the log can't be written), the
+        # plugin still gets the reason from the result file.
         write_record(args.result_json, record)
+        if record["error"]:
+            print(f"   FAILED: {record['error']}")
         if record["error"] and client is not None and record["error"].startswith("AuthenticationError"):
             print("   Set ANTHROPIC_API_KEY (or run `ant auth login`) and try again.")
             break
